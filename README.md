@@ -20,8 +20,15 @@ Or run the named binary directly:
 cargo run --bin brain -- analyze ./target/idl/my_program.json
 ```
 
+Add `--json` to emit machine-readable output:
+
+```bash
+cargo run -- analyze --json ./target/idl/my_program.json
+```
+
 You can also point it at any Rust file or folder, or omit the path to scan the
-current directory:
+current directory. If the directory contains Anchor IDL JSON files, Warpcore
+analyzes those first:
 
 ```bash
 cargo run -- analyze ./src

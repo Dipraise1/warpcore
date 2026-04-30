@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const SHARED_ACCOUNT_HINTS: &[&str] = &[
     "admin",
@@ -18,7 +18,7 @@ const SHARED_ACCOUNT_HINTS: &[&str] = &[
     "vault",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
     pub path: PathBuf,
     pub analysis_mode: AnalysisMode,
@@ -33,13 +33,13 @@ pub struct AnalysisReport {
     pub score: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AnalysisMode {
     AnchorIdl,
     RustHeuristic,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct AccountFinding {
     pub name: String,
     pub file: PathBuf,
@@ -48,7 +48,7 @@ pub struct AccountFinding {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AccountHotspot {
     pub name: String,
     pub total_occurrences: usize,
@@ -57,7 +57,7 @@ pub struct AccountHotspot {
     pub contexts: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConflictPair {
     pub left_context: String,
     pub right_context: String,
@@ -74,6 +74,14 @@ pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
         return analyze_idl_file(path);
     }
 
+    if path.is_dir() {
+        let mut json_files = Vec::new();
+        collect_files_with_extension(path, "json", &mut json_files)?;
+        if !json_files.is_empty() {
+            return analyze_idl_directory(path, json_files);
+        }
+    }
+
     analyze_rust_path(path)
 }
 
@@ -86,7 +94,6 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
     let mut mutable_accounts = BTreeSet::new();
     let mut shared_accounts = BTreeSet::new();
     let mut account_frequency = BTreeMap::<String, usize>::new();
-    let mut account_stats = BTreeMap::<String, AccountStats>::new();
 
     for file in &files {
         let source = fs::read_to_string(file)?;
@@ -112,6 +119,7 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
         .filter(|(_, count)| *count > 1)
         .collect::<Vec<_>>();
 
+    let mut account_stats = BTreeMap::<String, AccountStats>::new();
     let hotspots = build_hotspots(&instruction_contexts, &mut account_stats);
     let conflicts = build_conflicts(&instruction_contexts);
 
@@ -141,6 +149,54 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
 
 fn analyze_idl_file(path: &Path) -> io::Result<AnalysisReport> {
     let source = fs::read_to_string(path)?;
+    let parts = analyze_idl_source(path, &source)?;
+    build_report(
+        path,
+        AnalysisMode::AnchorIdl,
+        1,
+        parts.instruction_contexts,
+        parts.total_accounts,
+        parts.mutable_accounts,
+        parts.shared_accounts,
+        parts.account_frequency,
+    )
+}
+
+fn analyze_idl_directory(path: &Path, json_files: Vec<PathBuf>) -> io::Result<AnalysisReport> {
+    let mut merged = IdlAnalysisParts::default();
+
+    for file in &json_files {
+        let source = fs::read_to_string(file)?;
+        let mut parts = analyze_idl_source(file, &source)?;
+        merged
+            .instruction_contexts
+            .append(&mut parts.instruction_contexts);
+        merged.total_accounts += parts.total_accounts;
+        merged.mutable_accounts.extend(parts.mutable_accounts);
+        merged.shared_accounts.extend(parts.shared_accounts);
+        for (name, count) in parts.account_frequency {
+            *merged.account_frequency.entry(name).or_default() += count;
+        }
+    }
+
+    merged.shared_accounts.extend(build_context_shared_accounts(
+        &merged.instruction_contexts,
+        path,
+    ));
+
+    build_report(
+        path,
+        AnalysisMode::AnchorIdl,
+        json_files.len(),
+        merged.instruction_contexts,
+        merged.total_accounts,
+        merged.mutable_accounts,
+        merged.shared_accounts,
+        merged.account_frequency,
+    )
+}
+
+fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts> {
     let idl: AnchorIdl = serde_json::from_str(&source).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -153,7 +209,7 @@ fn analyze_idl_file(path: &Path) -> io::Result<AnalysisReport> {
     let mut mutable_accounts = BTreeSet::new();
     let mut shared_accounts = BTreeSet::new();
     let mut account_frequency = BTreeMap::<String, usize>::new();
-    let account_stats = BTreeMap::<String, AccountStats>::new();
+    let mut account_contexts = BTreeMap::<String, BTreeSet<String>>::new();
 
     for instruction in idl.instructions {
         let mut context = InstructionContext {
@@ -166,6 +222,10 @@ fn analyze_idl_file(path: &Path) -> io::Result<AnalysisReport> {
         for account in flatten_idl_accounts(&instruction.accounts) {
             total_accounts += 1;
             *account_frequency.entry(account.name.clone()).or_default() += 1;
+            account_contexts
+                .entry(account.name.clone())
+                .or_default()
+                .insert(context.name.clone());
 
             if account.is_mut {
                 mutable_accounts.insert(AccountFinding {
@@ -186,21 +246,25 @@ fn analyze_idl_file(path: &Path) -> io::Result<AnalysisReport> {
         instruction_contexts.push(context);
     }
 
-    for finding in build_shared_idl_findings(&instruction_contexts, path) {
-        shared_accounts.insert(finding);
+    for (name, contexts) in account_contexts {
+        if contexts.len() > 1 {
+            shared_accounts.insert(AccountFinding {
+                name,
+                file: path.to_path_buf(),
+                line: 0,
+                context: "IDL".to_string(),
+                reason: format!("appears in {} instruction contexts", contexts.len()),
+            });
+        }
     }
 
-    build_report(
-        path,
-        AnalysisMode::AnchorIdl,
-        1,
+    Ok(IdlAnalysisParts {
         instruction_contexts,
         total_accounts,
         mutable_accounts,
         shared_accounts,
         account_frequency,
-        account_stats,
-    )
+    })
 }
 
 fn build_report(
@@ -212,13 +276,13 @@ fn build_report(
     mutable_accounts: BTreeSet<AccountFinding>,
     shared_accounts: BTreeSet<AccountFinding>,
     account_frequency: BTreeMap<String, usize>,
-    mut account_stats: BTreeMap<String, AccountStats>,
 ) -> io::Result<AnalysisReport> {
     let repeated_accounts = account_frequency
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .collect::<Vec<_>>();
 
+    let mut account_stats = BTreeMap::<String, AccountStats>::new();
     let hotspots = build_hotspots(&instruction_contexts, &mut account_stats);
     let conflicts = build_conflicts(&instruction_contexts);
 
@@ -406,6 +470,15 @@ struct SourceReport {
     mutable_accounts: Vec<AccountFinding>,
     shared_accounts: Vec<AccountFinding>,
     account_names: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct IdlAnalysisParts {
+    instruction_contexts: Vec<InstructionContext>,
+    total_accounts: usize,
+    mutable_accounts: BTreeSet<AccountFinding>,
+    shared_accounts: BTreeSet<AccountFinding>,
+    account_frequency: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,6 +678,84 @@ fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+fn collect_files_with_extension(
+    path: &Path,
+    extension: &str,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    if path.is_file() {
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+        {
+            files.push(path.to_path_buf());
+        }
+        return Ok(());
+    }
+
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("path does not exist: {}", path.display()),
+        ));
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+
+        if should_skip(&child) {
+            continue;
+        }
+
+        if child.is_dir() {
+            collect_files_with_extension(&child, extension, files)?;
+        } else if child
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+        {
+            files.push(child);
+        }
+    }
+
+    Ok(())
+}
+
+fn build_context_shared_accounts(
+    instruction_contexts: &[InstructionContext],
+    file: &Path,
+) -> BTreeSet<AccountFinding> {
+    let mut occurrences = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for context in instruction_contexts {
+        let context_label = context.label();
+        let mut seen = BTreeSet::new();
+
+        for account in &context.accounts {
+            if seen.insert(account.name.clone()) {
+                occurrences
+                    .entry(account.name.clone())
+                    .or_default()
+                    .insert(context_label.clone());
+            }
+        }
+    }
+
+    occurrences
+        .into_iter()
+        .filter(|(_, contexts)| contexts.len() > 1)
+        .map(|(name, contexts)| AccountFinding {
+            name,
+            file: file.to_path_buf(),
+            line: 0,
+            context: "IDL".to_string(),
+            reason: format!("appears in {} instruction contexts", contexts.len()),
+        })
+        .collect()
+}
+
 fn should_skip(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -637,39 +788,6 @@ fn flatten_idl_accounts(items: &[AnchorIdlAccountItem]) -> Vec<FlattenedIdlAccou
     }
 
     flattened
-}
-
-fn build_shared_idl_findings(
-    instruction_contexts: &[InstructionContext],
-    file: &Path,
-) -> Vec<AccountFinding> {
-    let mut occurrences = BTreeMap::<String, Vec<String>>::new();
-
-    for context in instruction_contexts {
-        let context_label = context.label();
-        let mut seen = BTreeSet::new();
-
-        for account in &context.accounts {
-            if seen.insert(account.name.clone()) {
-                occurrences
-                    .entry(account.name.clone())
-                    .or_default()
-                    .push(context_label.clone());
-            }
-        }
-    }
-
-    occurrences
-        .into_iter()
-        .filter(|(_, contexts)| contexts.len() > 1)
-        .map(|(name, contexts)| AccountFinding {
-            name,
-            file: file.to_path_buf(),
-            line: 0,
-            context: "IDL".to_string(),
-            reason: format!("appears in {} instruction contexts", contexts.len()),
-        })
-        .collect()
 }
 
 fn parse_account_field(line: &str) -> Option<String> {
