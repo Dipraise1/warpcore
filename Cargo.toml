@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "A basic Solana parallelism analyzer prototype."
 
+[[bin]]
+name = "brain"
+path = "src/brain.rs"
+
 [dependencies]

@@ -15,6 +15,12 @@ state, and repeated account names.
 cargo run -- analyze ./program
 ```
 
+Or run the named binary directly:
+
+```bash
+cargo run --bin brain -- analyze ./program
+```
+
 You can also point it at any Rust file or folder:
 
 ```bash
