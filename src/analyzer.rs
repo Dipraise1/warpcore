@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 const SHARED_ACCOUNT_HINTS: &[&str] = &[
     "admin",
     "authority",
@@ -19,6 +21,7 @@ const SHARED_ACCOUNT_HINTS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct AnalysisReport {
     pub path: PathBuf,
+    pub analysis_mode: AnalysisMode,
     pub files_scanned: usize,
     pub instruction_contexts: usize,
     pub total_accounts: usize,
@@ -28,6 +31,12 @@ pub struct AnalysisReport {
     pub hotspots: Vec<AccountHotspot>,
     pub conflicts: Vec<ConflictPair>,
     pub score: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisMode {
+    AnchorIdl,
+    RustHeuristic,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -56,6 +65,19 @@ pub struct ConflictPair {
 }
 
 pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
+    if path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return analyze_idl_file(path);
+    }
+
+    analyze_rust_path(path)
+}
+
+fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
     let mut files = Vec::new();
     collect_rust_files(path, &mut files)?;
 
@@ -104,7 +126,115 @@ pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
 
     Ok(AnalysisReport {
         path: path.to_path_buf(),
+        analysis_mode: AnalysisMode::RustHeuristic,
         files_scanned: files.len(),
+        instruction_contexts: instruction_contexts.len(),
+        total_accounts,
+        mutable_accounts: mutable_accounts.into_iter().collect(),
+        shared_accounts: shared_accounts.into_iter().collect(),
+        repeated_accounts,
+        hotspots,
+        conflicts,
+        score,
+    })
+}
+
+fn analyze_idl_file(path: &Path) -> io::Result<AnalysisReport> {
+    let source = fs::read_to_string(path)?;
+    let idl: AnchorIdl = serde_json::from_str(&source).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse Anchor IDL {}: {}", path.display(), error),
+        )
+    })?;
+
+    let mut instruction_contexts = Vec::new();
+    let mut total_accounts = 0;
+    let mut mutable_accounts = BTreeSet::new();
+    let mut shared_accounts = BTreeSet::new();
+    let mut account_frequency = BTreeMap::<String, usize>::new();
+    let account_stats = BTreeMap::<String, AccountStats>::new();
+
+    for instruction in idl.instructions {
+        let mut context = InstructionContext {
+            name: instruction.name,
+            file: path.to_path_buf(),
+            line: 0,
+            accounts: Vec::new(),
+        };
+
+        for account in flatten_idl_accounts(&instruction.accounts) {
+            total_accounts += 1;
+            *account_frequency.entry(account.name.clone()).or_default() += 1;
+
+            if account.is_mut {
+                mutable_accounts.insert(AccountFinding {
+                    name: account.name.clone(),
+                    file: path.to_path_buf(),
+                    line: 0,
+                    context: context.name.clone(),
+                    reason: "declared mutable in Anchor IDL".to_string(),
+                });
+            }
+
+            context.accounts.push(AccountOccurrence {
+                name: account.name,
+                mutable: account.is_mut,
+            });
+        }
+
+        instruction_contexts.push(context);
+    }
+
+    for finding in build_shared_idl_findings(&instruction_contexts, path) {
+        shared_accounts.insert(finding);
+    }
+
+    build_report(
+        path,
+        AnalysisMode::AnchorIdl,
+        1,
+        instruction_contexts,
+        total_accounts,
+        mutable_accounts,
+        shared_accounts,
+        account_frequency,
+        account_stats,
+    )
+}
+
+fn build_report(
+    path: &Path,
+    analysis_mode: AnalysisMode,
+    files_scanned: usize,
+    instruction_contexts: Vec<InstructionContext>,
+    total_accounts: usize,
+    mutable_accounts: BTreeSet<AccountFinding>,
+    shared_accounts: BTreeSet<AccountFinding>,
+    account_frequency: BTreeMap<String, usize>,
+    mut account_stats: BTreeMap<String, AccountStats>,
+) -> io::Result<AnalysisReport> {
+    let repeated_accounts = account_frequency
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .collect::<Vec<_>>();
+
+    let hotspots = build_hotspots(&instruction_contexts, &mut account_stats);
+    let conflicts = build_conflicts(&instruction_contexts);
+
+    let score = score_parallelism(
+        total_accounts,
+        mutable_accounts.len(),
+        shared_accounts.len(),
+        repeated_accounts.len(),
+        hotspots.len(),
+        conflicts.len(),
+    );
+
+    Ok(AnalysisReport {
+        path: path.to_path_buf(),
+        analysis_mode,
+        files_scanned,
         instruction_contexts: instruction_contexts.len(),
         total_accounts,
         mutable_accounts: mutable_accounts.into_iter().collect(),
@@ -123,7 +253,8 @@ impl AnalysisReport {
         output.push_str("Warpcore analysis\n");
         output.push_str("=================\n\n");
         output.push_str(&format!("Path: {}\n", self.path.display()));
-        output.push_str(&format!("Rust files scanned: {}\n", self.files_scanned));
+        output.push_str(&format!("Analysis mode: {}\n", self.analysis_mode.label()));
+        output.push_str(&format!("Files scanned: {}\n", self.files_scanned));
         output.push_str(&format!(
             "Instruction contexts found: {}\n",
             self.instruction_contexts
@@ -133,10 +264,20 @@ impl AnalysisReport {
         output.push_str(&format!("Expected gain: {}\n\n", self.expected_gain()));
 
         if self.total_accounts == 0 {
-            output.push_str("No Anchor-style accounts were detected yet.\n");
-            output.push_str(
-                "Next step: point Warpcore at a Solana program with #[derive(Accounts)] structs.\n",
-            );
+            match self.analysis_mode {
+                AnalysisMode::AnchorIdl => {
+                    output.push_str("No IDL instructions with accounts were detected yet.\n");
+                    output.push_str(
+                        "Next step: point Warpcore at an exported Anchor IDL JSON file.\n",
+                    );
+                }
+                AnalysisMode::RustHeuristic => {
+                    output.push_str("No Anchor-style accounts were detected yet.\n");
+                    output.push_str(
+                        "Next step: point Warpcore at a Solana program with #[derive(Accounts)] structs.\n",
+                    );
+                }
+            }
             return output;
         }
 
@@ -235,7 +376,7 @@ impl AnalysisReport {
         );
 
         output.push_str(
-            "\nPrototype note: this is a static heuristic scanner, not a full Solana runtime profiler yet.\n",
+            "\nPrototype note: this is an analyzer prototype. IDL mode uses Anchor metadata; Rust mode is still heuristic.\n",
         );
         output
     }
@@ -249,6 +390,15 @@ impl AnalysisReport {
     }
 }
 
+impl AnalysisMode {
+    fn label(self) -> &'static str {
+        match self {
+            AnalysisMode::AnchorIdl => "Anchor IDL",
+            AnalysisMode::RustHeuristic => "Rust source heuristic",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SourceReport {
     instruction_contexts: Vec<InstructionContext>,
@@ -256,6 +406,34 @@ struct SourceReport {
     mutable_accounts: Vec<AccountFinding>,
     shared_accounts: Vec<AccountFinding>,
     account_names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnchorIdl {
+    #[serde(default)]
+    instructions: Vec<AnchorIdlInstruction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnchorIdlInstruction {
+    name: String,
+    #[serde(default)]
+    accounts: Vec<AnchorIdlAccountItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AnchorIdlAccountItem {
+    Group {
+        #[serde(rename = "name")]
+        _name: String,
+        accounts: Vec<AnchorIdlAccountItem>,
+    },
+    Account {
+        name: String,
+        #[serde(default, rename = "isMut", alias = "mut")]
+        is_mut: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +613,65 @@ fn should_skip(path: &Path) -> bool {
     matches!(name, ".git" | "node_modules" | "target")
 }
 
+#[derive(Debug, Clone)]
+struct FlattenedIdlAccount {
+    name: String,
+    is_mut: bool,
+}
+
+fn flatten_idl_accounts(items: &[AnchorIdlAccountItem]) -> Vec<FlattenedIdlAccount> {
+    let mut flattened = Vec::new();
+
+    for item in items {
+        match item {
+            AnchorIdlAccountItem::Account { name, is_mut } => {
+                flattened.push(FlattenedIdlAccount {
+                    name: name.clone(),
+                    is_mut: *is_mut,
+                });
+            }
+            AnchorIdlAccountItem::Group { accounts, .. } => {
+                flattened.extend(flatten_idl_accounts(accounts));
+            }
+        }
+    }
+
+    flattened
+}
+
+fn build_shared_idl_findings(
+    instruction_contexts: &[InstructionContext],
+    file: &Path,
+) -> Vec<AccountFinding> {
+    let mut occurrences = BTreeMap::<String, Vec<String>>::new();
+
+    for context in instruction_contexts {
+        let context_label = context.label();
+        let mut seen = BTreeSet::new();
+
+        for account in &context.accounts {
+            if seen.insert(account.name.clone()) {
+                occurrences
+                    .entry(account.name.clone())
+                    .or_default()
+                    .push(context_label.clone());
+            }
+        }
+    }
+
+    occurrences
+        .into_iter()
+        .filter(|(_, contexts)| contexts.len() > 1)
+        .map(|(name, contexts)| AccountFinding {
+            name,
+            file: file.to_path_buf(),
+            line: 0,
+            context: "IDL".to_string(),
+            reason: format!("appears in {} instruction contexts", contexts.len()),
+        })
+        .collect()
+}
+
 fn parse_account_field(line: &str) -> Option<String> {
     if !line.starts_with("pub ") || !line.contains(':') {
         return None;
@@ -609,7 +846,11 @@ fn shared_writable_accounts(left: &InstructionContext, right: &InstructionContex
 
 impl InstructionContext {
     fn label(&self) -> String {
-        format!("{} @ {}:{}", self.name, self.file.display(), self.line)
+        if self.line == 0 {
+            format!("{} @ {}", self.name, self.file.display())
+        } else {
+            format!("{} @ {}:{}", self.name, self.file.display(), self.line)
+        }
     }
 
     fn account_names(&self) -> BTreeSet<String> {
@@ -673,5 +914,44 @@ pub struct Swap<'info> {
         let conflicts = build_conflicts(&[left, right]);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].shared_accounts, vec!["vault".to_string()]);
+    }
+
+    #[test]
+    fn analyzes_anchor_idl_json() {
+        let fixture =
+            std::env::temp_dir().join(format!("warpcore-idl-{}.json", std::process::id()));
+        let json = r#"
+{
+  "instructions": [
+    {
+      "name": "deposit",
+      "accounts": [
+        { "name": "vault", "isMut": true },
+        { "name": "user", "isMut": false }
+      ]
+    },
+    {
+      "name": "withdraw",
+      "accounts": [
+        { "name": "vault", "isMut": true },
+        { "name": "user", "isMut": false }
+      ]
+    }
+  ]
+}
+"#;
+
+        std::fs::write(&fixture, json).expect("write fixture");
+        let report = analyze_path(&fixture).expect("analyze idl");
+        let _ = std::fs::remove_file(&fixture);
+
+        assert_eq!(report.analysis_mode, AnalysisMode::AnchorIdl);
+        assert_eq!(report.instruction_contexts, 2);
+        assert_eq!(report.total_accounts, 4);
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(report
+            .repeated_accounts
+            .iter()
+            .any(|(name, count)| name == "vault" && *count == 2));
     }
 }

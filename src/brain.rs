@@ -29,6 +29,7 @@ fn main() {
             println!();
             println!("Example:");
             println!("  warpcore analyze ./programs/my_solana_program");
+            println!("  warpcore analyze ./target/idl/my_program.json");
         }
         Some(other) => {
             eprintln!("Unknown command: {}", other);

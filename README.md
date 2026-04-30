@@ -5,20 +5,19 @@ It helps answer one question:
 
 > Why is this Solana program not running in parallel?
 
-This is the first basic prototype. It scans Rust/Anchor-style account structs
-and reports likely parallelism blockers such as mutable accounts, shared/global
-state, repeated account names, hotspot accounts, and shared writable conflicts.
+This is the first real product slice. It can analyze exported Anchor IDL JSON
+files directly, and it still supports a Rust-source heuristic fallback.
 
 ## Run
 
 ```bash
-cargo run -- analyze ./program
+cargo run -- analyze ./target/idl/my_program.json
 ```
 
 Or run the named binary directly:
 
 ```bash
-cargo run --bin brain -- analyze ./program
+cargo run --bin brain -- analyze ./target/idl/my_program.json
 ```
 
 You can also point it at any Rust file or folder, or omit the path to scan the
@@ -27,6 +26,7 @@ current directory:
 ```bash
 cargo run -- analyze ./src
 cargo run -- analyze
+cargo run -- analyze ./target/idl/my_program.json
 ```
 
 ## Example Output
@@ -46,6 +46,7 @@ What is blocking parallelism
 
 ## What It Checks Today
 
+- Anchor IDL instruction accounts and mutability
 - Mutable Anchor accounts using `#[account(mut)]`
 - Account names that look shared, such as `global_state`, `config`, `vault`, or `treasury`
 - Repeated account names across account contexts
@@ -55,8 +56,8 @@ What is blocking parallelism
 
 ## Roadmap
 
-- Parse full Anchor IDLs
 - Build transaction conflict graphs
+- Export JSON reports for automation
 - Detect unnecessary writable accounts
 - Suggest PDA sharding strategies
 - Compare before/after expected throughput
