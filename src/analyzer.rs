@@ -20,11 +20,13 @@ const SHARED_ACCOUNT_HINTS: &[&str] = &[
 pub struct AnalysisReport {
     pub path: PathBuf,
     pub files_scanned: usize,
-    pub account_structs: usize,
+    pub instruction_contexts: usize,
     pub total_accounts: usize,
     pub mutable_accounts: Vec<AccountFinding>,
     pub shared_accounts: Vec<AccountFinding>,
     pub repeated_accounts: Vec<(String, usize)>,
+    pub hotspots: Vec<AccountHotspot>,
+    pub conflicts: Vec<ConflictPair>,
     pub score: u8,
 }
 
@@ -33,23 +35,41 @@ pub struct AccountFinding {
     pub name: String,
     pub file: PathBuf,
     pub line: usize,
+    pub context: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountHotspot {
+    pub name: String,
+    pub total_occurrences: usize,
+    pub writable_occurrences: usize,
+    pub context_count: usize,
+    pub contexts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictPair {
+    pub left_context: String,
+    pub right_context: String,
+    pub shared_accounts: Vec<String>,
 }
 
 pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
     let mut files = Vec::new();
     collect_rust_files(path, &mut files)?;
 
-    let mut account_structs = 0;
+    let mut instruction_contexts = Vec::new();
     let mut total_accounts = 0;
     let mut mutable_accounts = BTreeSet::new();
     let mut shared_accounts = BTreeSet::new();
     let mut account_frequency = BTreeMap::<String, usize>::new();
+    let mut account_stats = BTreeMap::<String, AccountStats>::new();
 
     for file in &files {
         let source = fs::read_to_string(file)?;
         let file_report = analyze_source(file, &source);
-        account_structs += file_report.account_structs;
+        instruction_contexts.extend(file_report.instruction_contexts);
         total_accounts += file_report.total_accounts;
 
         for finding in file_report.mutable_accounts {
@@ -70,21 +90,28 @@ pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
         .filter(|(_, count)| *count > 1)
         .collect::<Vec<_>>();
 
+    let hotspots = build_hotspots(&instruction_contexts, &mut account_stats);
+    let conflicts = build_conflicts(&instruction_contexts);
+
     let score = score_parallelism(
         total_accounts,
         mutable_accounts.len(),
         shared_accounts.len(),
         repeated_accounts.len(),
+        hotspots.len(),
+        conflicts.len(),
     );
 
     Ok(AnalysisReport {
         path: path.to_path_buf(),
         files_scanned: files.len(),
-        account_structs,
+        instruction_contexts: instruction_contexts.len(),
         total_accounts,
         mutable_accounts: mutable_accounts.into_iter().collect(),
         shared_accounts: shared_accounts.into_iter().collect(),
         repeated_accounts,
+        hotspots,
+        conflicts,
         score,
     })
 }
@@ -98,8 +125,8 @@ impl AnalysisReport {
         output.push_str(&format!("Path: {}\n", self.path.display()));
         output.push_str(&format!("Rust files scanned: {}\n", self.files_scanned));
         output.push_str(&format!(
-            "Account structs found: {}\n",
-            self.account_structs
+            "Instruction contexts found: {}\n",
+            self.instruction_contexts
         ));
         output.push_str(&format!("Accounts inspected: {}\n\n", self.total_accounts));
         output.push_str(&format!("Parallelism score: {}/100\n", self.score));
@@ -113,49 +140,90 @@ impl AnalysisReport {
             return output;
         }
 
-        output.push_str("What is blocking parallelism\n");
-        output.push_str("----------------------------\n");
+        output.push_str("Hot accounts\n");
+        output.push_str("------------\n");
 
-        if self.mutable_accounts.is_empty()
-            && self.shared_accounts.is_empty()
-            && self.repeated_accounts.is_empty()
-        {
-            output.push_str("- No obvious write-lock bottlenecks found by the basic scanner.\n");
+        if self.hotspots.is_empty() {
+            output.push_str("- No obvious account hot spots found by the basic scanner.\n");
         } else {
-            for finding in self.mutable_accounts.iter().take(8) {
+            for hotspot in self.hotspots.iter().take(8) {
+                let sample_contexts = hotspot
+                    .contexts
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 output.push_str(&format!(
-                    "- {}:{} `{}` is mutable, so Solana must write-lock it.\n",
-                    finding.file.display(),
-                    finding.line,
-                    finding.name
-                ));
-            }
-
-            for finding in self.shared_accounts.iter().take(8) {
-                output.push_str(&format!(
-                    "- {}:{} `{}` looks like shared state: {}.\n",
-                    finding.file.display(),
-                    finding.line,
-                    finding.name,
-                    finding.reason
-                ));
-            }
-
-            for (name, count) in self.repeated_accounts.iter().take(8) {
-                output.push_str(&format!(
-                    "- `{}` appears in {} account contexts, which may serialize unrelated transactions.\n",
-                    name, count
+                    "- `{}` appears {} times across {} contexts ({} writable occurrences){}\n",
+                    hotspot.name,
+                    hotspot.total_occurrences,
+                    hotspot.context_count,
+                    hotspot.writable_occurrences,
+                    if sample_contexts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", sample_contexts)
+                    }
                 ));
             }
         }
 
-        output.push_str("\nWhy it is happening\n");
-        output.push_str("-------------------\n");
-        output.push_str("- Mutable accounts create write locks.\n");
-        output.push_str("- Shared/global accounts force unrelated users through the same state.\n");
-        output.push_str(
-            "- Reused account names across instructions can indicate hidden contention.\n",
-        );
+        output.push_str("\nConflicting contexts\n");
+        output.push_str("--------------------\n");
+
+        if self.conflicts.is_empty() {
+            output.push_str(
+                "- No shared writable accounts were found between instruction contexts.\n",
+            );
+        } else {
+            for conflict in self.conflicts.iter().take(8) {
+                output.push_str(&format!(
+                    "- {} <-> {} share `{}`\n",
+                    conflict.left_context,
+                    conflict.right_context,
+                    conflict.shared_accounts.join("`, `")
+                ));
+            }
+        }
+
+        if !self.mutable_accounts.is_empty() || !self.shared_accounts.is_empty() {
+            output.push_str("\nWrite lock signals\n");
+            output.push_str("------------------\n");
+
+            for finding in self.mutable_accounts.iter().take(6) {
+                output.push_str(&format!(
+                    "- {}:{} {} -> `{}` is mutable.\n",
+                    finding.file.display(),
+                    finding.line,
+                    finding.context,
+                    finding.name
+                ));
+            }
+
+            for finding in self.shared_accounts.iter().take(6) {
+                output.push_str(&format!(
+                    "- {}:{} {} -> `{}` looks shared ({})\n",
+                    finding.file.display(),
+                    finding.line,
+                    finding.context,
+                    finding.name,
+                    finding.reason
+                ));
+            }
+        }
+
+        if !self.repeated_accounts.is_empty() {
+            output.push_str("\nRepeated accounts\n");
+            output.push_str("-----------------\n");
+
+            for (name, count) in self.repeated_accounts.iter().take(6) {
+                output.push_str(&format!(
+                    "- `{}` appears in {} account contexts.\n",
+                    name, count
+                ));
+            }
+        }
 
         output.push_str("\nHow to fix it\n");
         output.push_str("-------------\n");
@@ -166,7 +234,9 @@ impl AnalysisReport {
             "- Design account sets so unrelated users touch different writable accounts.\n",
         );
 
-        output.push_str("\nPrototype note: this is a static heuristic scanner, not a full Solana runtime profiler yet.\n");
+        output.push_str(
+            "\nPrototype note: this is a static heuristic scanner, not a full Solana runtime profiler yet.\n",
+        );
         output
     }
 
@@ -181,15 +251,36 @@ impl AnalysisReport {
 
 #[derive(Debug)]
 struct SourceReport {
-    account_structs: usize,
+    instruction_contexts: Vec<InstructionContext>,
     total_accounts: usize,
     mutable_accounts: Vec<AccountFinding>,
     shared_accounts: Vec<AccountFinding>,
     account_names: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct InstructionContext {
+    name: String,
+    file: PathBuf,
+    line: usize,
+    accounts: Vec<AccountOccurrence>,
+}
+
+#[derive(Debug, Clone)]
+struct AccountOccurrence {
+    name: String,
+    mutable: bool,
+}
+
+#[derive(Debug, Default)]
+struct AccountStats {
+    total_occurrences: usize,
+    writable_occurrences: usize,
+    contexts: BTreeSet<String>,
+}
+
 fn analyze_source(file: &Path, source: &str) -> SourceReport {
-    let mut account_structs = 0;
+    let mut instruction_contexts = Vec::new();
     let mut total_accounts = 0;
     let mut mutable_accounts = Vec::new();
     let mut shared_accounts = Vec::new();
@@ -199,6 +290,7 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
     let mut saw_accounts_derive = false;
     let mut brace_depth = 0usize;
     let mut pending_mut = false;
+    let mut current_context: Option<InstructionContext> = None;
 
     for (index, raw_line) in source.lines().enumerate() {
         let line_number = index + 1;
@@ -210,13 +302,20 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
 
         if line.contains("#[derive") && line.contains("Accounts") {
             saw_accounts_derive = true;
+            continue;
         }
 
         if saw_accounts_derive && line.starts_with("pub struct ") {
             in_accounts_struct = true;
             saw_accounts_derive = false;
-            account_structs += 1;
+            let context_name = parse_struct_name(line).unwrap_or_else(|| "Accounts".to_string());
             brace_depth = count_char(line, '{').saturating_sub(count_char(line, '}'));
+            current_context = Some(InstructionContext {
+                name: context_name,
+                file: file.to_path_buf(),
+                line: line_number,
+                accounts: Vec::new(),
+            });
             continue;
         }
 
@@ -236,34 +335,58 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
             total_accounts += 1;
             account_names.push(account_name.clone());
 
+            let mutable = pending_mut;
+            let context_name = current_context
+                .as_ref()
+                .map(|context| context.name.clone())
+                .unwrap_or_else(|| "Accounts".to_string());
+            let context_file = file.to_path_buf();
+
             if pending_mut {
                 mutable_accounts.push(AccountFinding {
                     name: account_name.clone(),
-                    file: file.to_path_buf(),
+                    file: context_file.clone(),
                     line: line_number,
+                    context: context_name.clone(),
                     reason: "marked mut".to_string(),
                 });
-                pending_mut = false;
             }
 
             if let Some(hint) = shared_account_hint(&account_name) {
                 shared_accounts.push(AccountFinding {
-                    name: account_name,
-                    file: file.to_path_buf(),
+                    name: account_name.clone(),
+                    file: context_file.clone(),
                     line: line_number,
+                    context: context_name,
                     reason: format!("name contains `{}`", hint),
                 });
             }
+
+            if let Some(context) = current_context.as_mut() {
+                context.accounts.push(AccountOccurrence {
+                    name: account_name.clone(),
+                    mutable,
+                });
+            }
+
+            pending_mut = false;
         }
 
         if brace_depth == 0 {
             in_accounts_struct = false;
             pending_mut = false;
+            if let Some(context) = current_context.take() {
+                instruction_contexts.push(context);
+            }
         }
     }
 
+    if let Some(context) = current_context.take() {
+        instruction_contexts.push(context);
+    }
+
     SourceReport {
-        account_structs,
+        instruction_contexts,
         total_accounts,
         mutable_accounts,
         shared_accounts,
@@ -331,6 +454,23 @@ fn parse_account_field(line: &str) -> Option<String> {
     }
 }
 
+fn parse_struct_name(line: &str) -> Option<String> {
+    if !line.starts_with("pub struct ") {
+        return None;
+    }
+
+    let rest = line.trim_start_matches("pub struct ").trim();
+    let name = rest
+        .split(|character: char| character == '<' || character == '{' || character.is_whitespace())
+        .next()?;
+
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 fn has_mut_attribute(line: &str) -> bool {
     line.contains("mut") && !line.contains("immutable")
 }
@@ -356,6 +496,8 @@ fn score_parallelism(
     mutable_accounts: usize,
     shared_accounts: usize,
     repeated_accounts: usize,
+    hotspots: usize,
+    conflicts: usize,
 ) -> u8 {
     if total_accounts == 0 {
         return 0;
@@ -365,6 +507,8 @@ fn score_parallelism(
     score -= ((mutable_accounts as f32 / total_accounts as f32) * 45.0).round() as i32;
     score -= ((shared_accounts as f32 / total_accounts as f32) * 35.0).round() as i32;
     score -= (repeated_accounts as i32 * 6).min(20);
+    score -= (hotspots as i32 * 3).min(18);
+    score -= (conflicts as i32 * 2).min(18);
     score.clamp(5, 100) as u8
 }
 
@@ -380,6 +524,106 @@ fn count_char(line: &str, target: char) -> usize {
     line.chars()
         .filter(|character| *character == target)
         .count()
+}
+
+fn build_hotspots(
+    contexts: &[InstructionContext],
+    stats: &mut BTreeMap<String, AccountStats>,
+) -> Vec<AccountHotspot> {
+    for context in contexts {
+        let context_label = context.label();
+        for account in &context.accounts {
+            let entry = stats.entry(account.name.clone()).or_default();
+            entry.total_occurrences += 1;
+            entry.contexts.insert(context_label.clone());
+            if account.mutable {
+                entry.writable_occurrences += 1;
+            }
+        }
+    }
+
+    let mut hotspots = stats
+        .iter()
+        .filter(|(_, stat)| stat.contexts.len() > 1 || stat.writable_occurrences > 1)
+        .map(|(name, stat)| AccountHotspot {
+            name: name.clone(),
+            total_occurrences: stat.total_occurrences,
+            writable_occurrences: stat.writable_occurrences,
+            context_count: stat.contexts.len(),
+            contexts: stat.contexts.iter().cloned().collect(),
+        })
+        .collect::<Vec<_>>();
+
+    hotspots.sort_by(|left, right| {
+        right
+            .context_count
+            .cmp(&left.context_count)
+            .then_with(|| right.writable_occurrences.cmp(&left.writable_occurrences))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    hotspots
+}
+
+fn build_conflicts(contexts: &[InstructionContext]) -> Vec<ConflictPair> {
+    let mut conflicts = Vec::new();
+
+    for left_index in 0..contexts.len() {
+        for right_index in (left_index + 1)..contexts.len() {
+            let left = &contexts[left_index];
+            let right = &contexts[right_index];
+            let shared_accounts = shared_writable_accounts(left, right);
+
+            if !shared_accounts.is_empty() {
+                conflicts.push(ConflictPair {
+                    left_context: left.label(),
+                    right_context: right.label(),
+                    shared_accounts,
+                });
+            }
+        }
+    }
+
+    conflicts.sort_by(|left, right| {
+        right
+            .shared_accounts
+            .len()
+            .cmp(&left.shared_accounts.len())
+            .then_with(|| left.left_context.cmp(&right.left_context))
+            .then_with(|| left.right_context.cmp(&right.right_context))
+    });
+
+    conflicts
+}
+
+fn shared_writable_accounts(left: &InstructionContext, right: &InstructionContext) -> Vec<String> {
+    let left_accounts = left.account_names();
+    let right_accounts = right.account_names();
+
+    left_accounts
+        .intersection(&right_accounts)
+        .filter(|name| left.is_writable(name) || right.is_writable(name))
+        .cloned()
+        .collect()
+}
+
+impl InstructionContext {
+    fn label(&self) -> String {
+        format!("{} @ {}:{}", self.name, self.file.display(), self.line)
+    }
+
+    fn account_names(&self) -> BTreeSet<String> {
+        self.accounts
+            .iter()
+            .map(|account| account.name.clone())
+            .collect()
+    }
+
+    fn is_writable(&self, account_name: &str) -> bool {
+        self.accounts
+            .iter()
+            .any(|account| account.name == account_name && account.mutable)
+    }
 }
 
 #[cfg(test)]
@@ -399,9 +643,35 @@ pub struct Swap<'info> {
 
         let report = analyze_source(Path::new("program.rs"), source);
 
-        assert_eq!(report.account_structs, 1);
+        assert_eq!(report.instruction_contexts.len(), 1);
         assert_eq!(report.total_accounts, 2);
         assert_eq!(report.mutable_accounts[0].name, "global_state");
         assert_eq!(report.shared_accounts.len(), 1);
+    }
+
+    #[test]
+    fn builds_conflicts_for_shared_writable_accounts() {
+        let left = InstructionContext {
+            name: "Swap".to_string(),
+            file: PathBuf::from("swap.rs"),
+            line: 1,
+            accounts: vec![AccountOccurrence {
+                name: "vault".to_string(),
+                mutable: true,
+            }],
+        };
+        let right = InstructionContext {
+            name: "Deposit".to_string(),
+            file: PathBuf::from("deposit.rs"),
+            line: 1,
+            accounts: vec![AccountOccurrence {
+                name: "vault".to_string(),
+                mutable: true,
+            }],
+        };
+
+        let conflicts = build_conflicts(&[left, right]);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].shared_accounts, vec!["vault".to_string()]);
     }
 }

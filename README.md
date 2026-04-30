@@ -7,7 +7,7 @@ It helps answer one question:
 
 This is the first basic prototype. It scans Rust/Anchor-style account structs
 and reports likely parallelism blockers such as mutable accounts, shared/global
-state, and repeated account names.
+state, repeated account names, hotspot accounts, and shared writable conflicts.
 
 ## Run
 
@@ -21,10 +21,12 @@ Or run the named binary directly:
 cargo run --bin brain -- analyze ./program
 ```
 
-You can also point it at any Rust file or folder:
+You can also point it at any Rust file or folder, or omit the path to scan the
+current directory:
 
 ```bash
 cargo run -- analyze ./src
+cargo run -- analyze
 ```
 
 ## Example Output
@@ -47,6 +49,8 @@ What is blocking parallelism
 - Mutable Anchor accounts using `#[account(mut)]`
 - Account names that look shared, such as `global_state`, `config`, `vault`, or `treasury`
 - Repeated account names across account contexts
+- Hot accounts that appear in multiple instruction contexts
+- Shared writable conflicts between instruction contexts
 - A rough parallelism score from `0` to `100`
 
 ## Roadmap

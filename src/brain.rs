@@ -10,10 +10,7 @@ fn main() {
 
     match command.as_deref() {
         Some("analyze") => {
-            let Some(path) = args.next() else {
-                eprintln!("Usage: warpcore analyze <program-path>");
-                process::exit(2);
-            };
+            let path = args.next().unwrap_or_else(|| ".".to_string());
 
             let path = PathBuf::from(path);
             match analyzer::analyze_path(&path) {
@@ -28,14 +25,14 @@ fn main() {
             println!("Warpcore");
             println!();
             println!("Usage:");
-            println!("  warpcore analyze <program-path>");
+            println!("  warpcore analyze [program-path]");
             println!();
             println!("Example:");
             println!("  warpcore analyze ./programs/my_solana_program");
         }
         Some(other) => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: warpcore analyze <program-path>");
+            eprintln!("Usage: warpcore analyze [program-path]");
             process::exit(2);
         }
     }
