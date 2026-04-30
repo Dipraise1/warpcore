@@ -30,6 +30,7 @@ pub struct AnalysisReport {
     pub repeated_accounts: Vec<(String, usize)>,
     pub hotspots: Vec<AccountHotspot>,
     pub conflicts: Vec<ConflictPair>,
+    pub conflict_graph: ConflictGraph,
     pub score: u8,
 }
 
@@ -62,6 +63,39 @@ pub struct ConflictPair {
     pub left_context: String,
     pub right_context: String,
     pub shared_accounts: Vec<String>,
+    pub severity: ConflictSeverity,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictGraph {
+    pub nodes: Vec<ConflictNode>,
+    pub edges: Vec<ConflictEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictNode {
+    pub context: String,
+    pub file: PathBuf,
+    pub line: usize,
+    pub account_count: usize,
+    pub writable_account_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictEdge {
+    pub left_context: String,
+    pub right_context: String,
+    pub shared_accounts: Vec<String>,
+    pub severity: ConflictSeverity,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum ConflictSeverity {
+    Low,
+    Medium,
+    High,
 }
 
 pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
@@ -121,7 +155,19 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
 
     let mut account_stats = BTreeMap::<String, AccountStats>::new();
     let hotspots = build_hotspots(&instruction_contexts, &mut account_stats);
-    let conflicts = build_conflicts(&instruction_contexts);
+    let conflict_graph = build_conflict_graph(&instruction_contexts);
+    let conflicts = conflict_graph
+        .edges
+        .iter()
+        .cloned()
+        .map(|edge| ConflictPair {
+            left_context: edge.left_context,
+            right_context: edge.right_context,
+            shared_accounts: edge.shared_accounts,
+            severity: edge.severity,
+            suggestions: edge.suggestions,
+        })
+        .collect::<Vec<_>>();
 
     let score = score_parallelism(
         total_accounts,
@@ -143,6 +189,7 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
         repeated_accounts,
         hotspots,
         conflicts,
+        conflict_graph,
         score,
     })
 }
@@ -209,7 +256,6 @@ fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts>
     let mut mutable_accounts = BTreeSet::new();
     let mut shared_accounts = BTreeSet::new();
     let mut account_frequency = BTreeMap::<String, usize>::new();
-    let mut account_contexts = BTreeMap::<String, BTreeSet<String>>::new();
 
     for instruction in idl.instructions {
         let mut context = InstructionContext {
@@ -222,10 +268,6 @@ fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts>
         for account in flatten_idl_accounts(&instruction.accounts) {
             total_accounts += 1;
             *account_frequency.entry(account.name.clone()).or_default() += 1;
-            account_contexts
-                .entry(account.name.clone())
-                .or_default()
-                .insert(context.name.clone());
 
             if account.is_mut {
                 mutable_accounts.insert(AccountFinding {
@@ -246,17 +288,7 @@ fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts>
         instruction_contexts.push(context);
     }
 
-    for (name, contexts) in account_contexts {
-        if contexts.len() > 1 {
-            shared_accounts.insert(AccountFinding {
-                name,
-                file: path.to_path_buf(),
-                line: 0,
-                context: "IDL".to_string(),
-                reason: format!("appears in {} instruction contexts", contexts.len()),
-            });
-        }
-    }
+    shared_accounts.extend(build_context_shared_accounts(&instruction_contexts, path));
 
     Ok(IdlAnalysisParts {
         instruction_contexts,
@@ -284,7 +316,19 @@ fn build_report(
 
     let mut account_stats = BTreeMap::<String, AccountStats>::new();
     let hotspots = build_hotspots(&instruction_contexts, &mut account_stats);
-    let conflicts = build_conflicts(&instruction_contexts);
+    let conflict_graph = build_conflict_graph(&instruction_contexts);
+    let conflicts = conflict_graph
+        .edges
+        .iter()
+        .cloned()
+        .map(|edge| ConflictPair {
+            left_context: edge.left_context,
+            right_context: edge.right_context,
+            shared_accounts: edge.shared_accounts,
+            severity: edge.severity,
+            suggestions: edge.suggestions,
+        })
+        .collect::<Vec<_>>();
 
     let score = score_parallelism(
         total_accounts,
@@ -306,6 +350,7 @@ fn build_report(
         repeated_accounts,
         hotspots,
         conflicts,
+        conflict_graph,
         score,
     })
 }
@@ -374,8 +419,8 @@ impl AnalysisReport {
             }
         }
 
-        output.push_str("\nConflicting contexts\n");
-        output.push_str("--------------------\n");
+        output.push_str("\nConflict graph\n");
+        output.push_str("--------------\n");
 
         if self.conflicts.is_empty() {
             output.push_str(
@@ -384,11 +429,15 @@ impl AnalysisReport {
         } else {
             for conflict in self.conflicts.iter().take(8) {
                 output.push_str(&format!(
-                    "- {} <-> {} share `{}`\n",
+                    "- [{}] {} <-> {} share `{}`\n",
+                    conflict.severity.label(),
                     conflict.left_context,
                     conflict.right_context,
                     conflict.shared_accounts.join("`, `")
                 ));
+                for suggestion in conflict.suggestions.iter().take(3) {
+                    output.push_str(&format!("  - {}\n", suggestion));
+                }
             }
         }
 
@@ -459,6 +508,16 @@ impl AnalysisMode {
         match self {
             AnalysisMode::AnchorIdl => "Anchor IDL",
             AnalysisMode::RustHeuristic => "Rust source heuristic",
+        }
+    }
+}
+
+impl ConflictSeverity {
+    fn label(self) -> &'static str {
+        match self {
+            ConflictSeverity::Low => "low",
+            ConflictSeverity::Medium => "medium",
+            ConflictSeverity::High => "high",
         }
     }
 }
@@ -920,8 +979,19 @@ fn build_hotspots(
     hotspots
 }
 
-fn build_conflicts(contexts: &[InstructionContext]) -> Vec<ConflictPair> {
-    let mut conflicts = Vec::new();
+fn build_conflict_graph(contexts: &[InstructionContext]) -> ConflictGraph {
+    let mut nodes = Vec::with_capacity(contexts.len());
+    let mut edges = Vec::new();
+
+    for context in contexts {
+        nodes.push(ConflictNode {
+            context: context.label(),
+            file: context.file.clone(),
+            line: context.line,
+            account_count: context.accounts.len(),
+            writable_account_count: context.writable_count(),
+        });
+    }
 
     for left_index in 0..contexts.len() {
         for right_index in (left_index + 1)..contexts.len() {
@@ -930,25 +1000,28 @@ fn build_conflicts(contexts: &[InstructionContext]) -> Vec<ConflictPair> {
             let shared_accounts = shared_writable_accounts(left, right);
 
             if !shared_accounts.is_empty() {
-                conflicts.push(ConflictPair {
+                let severity = classify_conflict_severity(left, right, &shared_accounts);
+                let suggestions = build_conflict_suggestions(&shared_accounts, severity);
+                edges.push(ConflictEdge {
                     left_context: left.label(),
                     right_context: right.label(),
                     shared_accounts,
+                    severity,
+                    suggestions,
                 });
             }
         }
     }
 
-    conflicts.sort_by(|left, right| {
-        right
-            .shared_accounts
-            .len()
-            .cmp(&left.shared_accounts.len())
+    edges.sort_by(|left, right| {
+        severity_rank(right.severity)
+            .cmp(&severity_rank(left.severity))
+            .then_with(|| right.shared_accounts.len().cmp(&left.shared_accounts.len()))
             .then_with(|| left.left_context.cmp(&right.left_context))
             .then_with(|| left.right_context.cmp(&right.right_context))
     });
 
-    conflicts
+    ConflictGraph { nodes, edges }
 }
 
 fn shared_writable_accounts(left: &InstructionContext, right: &InstructionContext) -> Vec<String> {
@@ -960,6 +1033,87 @@ fn shared_writable_accounts(left: &InstructionContext, right: &InstructionContex
         .filter(|name| left.is_writable(name) || right.is_writable(name))
         .cloned()
         .collect()
+}
+
+fn classify_conflict_severity(
+    left: &InstructionContext,
+    right: &InstructionContext,
+    shared_accounts: &[String],
+) -> ConflictSeverity {
+    if shared_accounts.len() >= 2
+        || shared_accounts
+            .iter()
+            .any(|name| shared_account_hint(name).is_some())
+        || left.writable_count() > 1
+        || right.writable_count() > 1
+    {
+        ConflictSeverity::High
+    } else if shared_accounts.len() == 1 {
+        ConflictSeverity::Medium
+    } else {
+        ConflictSeverity::Low
+    }
+}
+
+fn build_conflict_suggestions(
+    shared_accounts: &[String],
+    severity: ConflictSeverity,
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    let shared_list = shared_accounts.join("`, `");
+
+    match shared_accounts {
+        [name] => {
+            if shared_account_hint(name).is_some() {
+                suggestions.push(format!(
+                    "Split `{}` into narrower PDAs so unrelated instructions stop sharing it.",
+                    name
+                ));
+            } else {
+                suggestions.push(format!(
+                    "Make `{}` read-only where possible, or move instruction-specific data into separate PDAs.",
+                    name
+                ));
+            }
+        }
+        _ => {
+            suggestions.push(format!(
+                "Split `{}` into per-user, per-market, or per-shard PDAs.",
+                shared_list
+            ));
+        }
+    }
+
+    match severity {
+        ConflictSeverity::High => {
+            suggestions.push(
+                "Remove unnecessary `mut` annotations from any account that is only read."
+                    .to_string(),
+            );
+            suggestions.push(
+                "Separate hot state from configuration and admin flows so unrelated traffic stops contending."
+                    .to_string(),
+            );
+        }
+        ConflictSeverity::Medium => {
+            suggestions.push(
+                "Check whether one side can read the account instead of writing it.".to_string(),
+            );
+        }
+        ConflictSeverity::Low => {
+            suggestions.push("Keep the shared account narrow and avoid reusing it across unrelated instructions.".to_string());
+        }
+    }
+
+    suggestions
+}
+
+fn severity_rank(severity: ConflictSeverity) -> usize {
+    match severity {
+        ConflictSeverity::Low => 0,
+        ConflictSeverity::Medium => 1,
+        ConflictSeverity::High => 2,
+    }
 }
 
 impl InstructionContext {
@@ -982,6 +1136,13 @@ impl InstructionContext {
         self.accounts
             .iter()
             .any(|account| account.name == account_name && account.mutable)
+    }
+
+    fn writable_count(&self) -> usize {
+        self.accounts
+            .iter()
+            .filter(|account| account.mutable)
+            .count()
     }
 }
 
@@ -1015,6 +1176,34 @@ pub struct Swap<'info> {
             file: PathBuf::from("swap.rs"),
             line: 1,
             accounts: vec![AccountOccurrence {
+                name: "position".to_string(),
+                mutable: true,
+            }],
+        };
+        let right = InstructionContext {
+            name: "Deposit".to_string(),
+            file: PathBuf::from("deposit.rs"),
+            line: 1,
+            accounts: vec![AccountOccurrence {
+                name: "position".to_string(),
+                mutable: true,
+            }],
+        };
+
+        let graph = build_conflict_graph(&[left, right]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].shared_accounts, vec!["position".to_string()]);
+        assert_eq!(graph.edges[0].severity.label(), "medium");
+        assert!(!graph.edges[0].suggestions.is_empty());
+    }
+
+    #[test]
+    fn classifies_shared_global_accounts_as_high_severity() {
+        let left = InstructionContext {
+            name: "Swap".to_string(),
+            file: PathBuf::from("swap.rs"),
+            line: 1,
+            accounts: vec![AccountOccurrence {
                 name: "vault".to_string(),
                 mutable: true,
             }],
@@ -1029,9 +1218,13 @@ pub struct Swap<'info> {
             }],
         };
 
-        let conflicts = build_conflicts(&[left, right]);
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].shared_accounts, vec!["vault".to_string()]);
+        let graph = build_conflict_graph(&[left, right]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].severity.label(), "high");
+        assert!(graph.edges[0]
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("vault")));
     }
 
     #[test]

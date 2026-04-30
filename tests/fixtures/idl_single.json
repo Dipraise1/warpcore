@@ -1,0 +1,18 @@
+{
+  "instructions": [
+    {
+      "name": "deposit",
+      "accounts": [
+        { "name": "vault", "isMut": true },
+        { "name": "user", "isMut": false }
+      ]
+    },
+    {
+      "name": "withdraw",
+      "accounts": [
+        { "name": "vault", "isMut": true },
+        { "name": "user", "isMut": false }
+      ]
+    }
+  ]
+}

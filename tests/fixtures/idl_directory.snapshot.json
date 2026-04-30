@@ -1,0 +1,120 @@
+{
+  "path": "tests/fixtures/idl_directory",
+  "analysis_mode": "AnchorIdl",
+  "files_scanned": 2,
+  "instruction_contexts": 2,
+  "total_accounts": 4,
+  "mutable_accounts": [
+    {
+      "name": "vault",
+      "file": "tests/fixtures/idl_directory/a.json",
+      "line": 0,
+      "context": "deposit",
+      "reason": "declared mutable in Anchor IDL"
+    },
+    {
+      "name": "vault",
+      "file": "tests/fixtures/idl_directory/b.json",
+      "line": 0,
+      "context": "withdraw",
+      "reason": "declared mutable in Anchor IDL"
+    }
+  ],
+  "shared_accounts": [
+    {
+      "name": "user",
+      "file": "tests/fixtures/idl_directory",
+      "line": 0,
+      "context": "IDL",
+      "reason": "appears in 2 instruction contexts"
+    },
+    {
+      "name": "vault",
+      "file": "tests/fixtures/idl_directory",
+      "line": 0,
+      "context": "IDL",
+      "reason": "appears in 2 instruction contexts"
+    }
+  ],
+  "repeated_accounts": [
+    [
+      "user",
+      2
+    ],
+    [
+      "vault",
+      2
+    ]
+  ],
+  "hotspots": [
+    {
+      "name": "vault",
+      "total_occurrences": 2,
+      "writable_occurrences": 2,
+      "context_count": 2,
+      "contexts": [
+        "deposit @ tests/fixtures/idl_directory/a.json",
+        "withdraw @ tests/fixtures/idl_directory/b.json"
+      ]
+    },
+    {
+      "name": "user",
+      "total_occurrences": 2,
+      "writable_occurrences": 0,
+      "context_count": 2,
+      "contexts": [
+        "deposit @ tests/fixtures/idl_directory/a.json",
+        "withdraw @ tests/fixtures/idl_directory/b.json"
+      ]
+    }
+  ],
+  "conflicts": [
+    {
+      "left_context": "deposit @ tests/fixtures/idl_directory/a.json",
+      "right_context": "withdraw @ tests/fixtures/idl_directory/b.json",
+      "shared_accounts": [
+        "vault"
+      ],
+      "severity": "High",
+      "suggestions": [
+        "Split `vault` into narrower PDAs so unrelated instructions stop sharing it.",
+        "Remove unnecessary `mut` annotations from any account that is only read.",
+        "Separate hot state from configuration and admin flows so unrelated traffic stops contending."
+      ]
+    }
+  ],
+  "conflict_graph": {
+    "nodes": [
+      {
+        "context": "deposit @ tests/fixtures/idl_directory/a.json",
+        "file": "tests/fixtures/idl_directory/a.json",
+        "line": 0,
+        "account_count": 2,
+        "writable_account_count": 1
+      },
+      {
+        "context": "withdraw @ tests/fixtures/idl_directory/b.json",
+        "file": "tests/fixtures/idl_directory/b.json",
+        "line": 0,
+        "account_count": 2,
+        "writable_account_count": 1
+      }
+    ],
+    "edges": [
+      {
+        "left_context": "deposit @ tests/fixtures/idl_directory/a.json",
+        "right_context": "withdraw @ tests/fixtures/idl_directory/b.json",
+        "shared_accounts": [
+          "vault"
+        ],
+        "severity": "High",
+        "suggestions": [
+          "Split `vault` into narrower PDAs so unrelated instructions stop sharing it.",
+          "Remove unnecessary `mut` annotations from any account that is only read.",
+          "Separate hot state from configuration and admin flows so unrelated traffic stops contending."
+        ]
+      }
+    ]
+  },
+  "score": 39
+}

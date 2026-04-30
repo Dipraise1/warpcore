@@ -1,8 +1,7 @@
-mod analyzer;
-
 use std::env;
 use std::path::PathBuf;
 use std::process;
+use warpcore::analyzer;
 
 fn main() {
     let mut args = env::args().skip(1);

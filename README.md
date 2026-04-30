@@ -26,6 +26,8 @@ Add `--json` to emit machine-readable output:
 cargo run -- analyze --json ./target/idl/my_program.json
 ```
 
+The JSON report includes the conflict graph, severity, and fix suggestions.
+
 You can also point it at any Rust file or folder, or omit the path to scan the
 current directory. If the directory contains Anchor IDL JSON files, Warpcore
 analyzes those first:
@@ -59,6 +61,7 @@ What is blocking parallelism
 - Repeated account names across account contexts
 - Hot accounts that appear in multiple instruction contexts
 - Shared writable conflicts between instruction contexts
+- Per-conflict severity and fix suggestions
 - A rough parallelism score from `0` to `100`
 
 ## Roadmap

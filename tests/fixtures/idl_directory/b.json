@@ -1,0 +1,11 @@
+{
+  "instructions": [
+    {
+      "name": "withdraw",
+      "accounts": [
+        { "name": "vault", "isMut": true },
+        { "name": "user", "isMut": false }
+      ]
+    }
+  ]
+}
