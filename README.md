@@ -28,6 +28,13 @@ cargo run -- analyze --json ./target/idl/my_program.json
 
 The JSON report includes the conflict graph, severity, and fix suggestions.
 
+Filter the visible conflicts by severity, cap the list length, and fail the
+command when blocking conflicts are present:
+
+```bash
+cargo run -- analyze --severity medium --top 5 --fail-on high ./target/idl/my_program.json
+```
+
 You can also point it at any Rust file or folder, or omit the path to scan the
 current directory. If the directory contains Anchor IDL JSON files, Warpcore
 analyzes those first:
@@ -63,6 +70,9 @@ What is blocking parallelism
 - Shared writable conflicts between instruction contexts
 - Per-conflict severity and fix suggestions
 - A rough parallelism score from `0` to `100`
+
+By default the CLI exits with code `1` when a `high` severity conflict is
+present. Use `--fail-on none` to disable that check.
 
 ## Roadmap
 

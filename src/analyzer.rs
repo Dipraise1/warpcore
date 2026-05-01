@@ -34,6 +34,37 @@ pub struct AnalysisReport {
     pub score: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportFilters {
+    pub severity_cutoff: ConflictSeverity,
+    pub top: Option<usize>,
+}
+
+impl Default for ReportFilters {
+    fn default() -> Self {
+        Self {
+            severity_cutoff: ConflictSeverity::Low,
+            top: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisView {
+    pub path: PathBuf,
+    pub analysis_mode: AnalysisMode,
+    pub files_scanned: usize,
+    pub instruction_contexts: usize,
+    pub total_accounts: usize,
+    pub mutable_accounts: Vec<AccountFinding>,
+    pub shared_accounts: Vec<AccountFinding>,
+    pub repeated_accounts: Vec<(String, usize)>,
+    pub hotspots: Vec<AccountHotspot>,
+    pub conflicts: Vec<ConflictPair>,
+    pub conflict_graph: ConflictGraph,
+    pub score: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum AnalysisMode {
     AnchorIdl,
@@ -91,7 +122,7 @@ pub struct ConflictEdge {
     pub suggestions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ConflictSeverity {
     Low,
     Medium,
@@ -356,6 +387,69 @@ fn build_report(
 }
 
 impl AnalysisReport {
+    pub fn view(&self, filters: ReportFilters) -> AnalysisView {
+        let filtered_conflicts = self
+            .conflict_graph
+            .edges
+            .iter()
+            .filter(|edge| edge.severity.rank() >= filters.severity_cutoff.rank())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let filtered_conflicts = match filters.top {
+            Some(limit) => filtered_conflicts
+                .into_iter()
+                .take(limit)
+                .collect::<Vec<_>>(),
+            None => filtered_conflicts,
+        };
+
+        let conflicts = filtered_conflicts
+            .iter()
+            .cloned()
+            .map(|edge| ConflictPair {
+                left_context: edge.left_context,
+                right_context: edge.right_context,
+                shared_accounts: edge.shared_accounts,
+                severity: edge.severity,
+                suggestions: edge.suggestions,
+            })
+            .collect::<Vec<_>>();
+
+        let conflict_graph = ConflictGraph {
+            nodes: self.conflict_graph.nodes.clone(),
+            edges: filtered_conflicts,
+        };
+
+        AnalysisView {
+            path: self.path.clone(),
+            analysis_mode: self.analysis_mode,
+            files_scanned: self.files_scanned,
+            instruction_contexts: self.instruction_contexts,
+            total_accounts: self.total_accounts,
+            mutable_accounts: self.mutable_accounts.clone(),
+            shared_accounts: self.shared_accounts.clone(),
+            repeated_accounts: self.repeated_accounts.clone(),
+            hotspots: self.hotspots.clone(),
+            conflicts,
+            conflict_graph,
+            score: self.score,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        self.view(ReportFilters::default()).render()
+    }
+
+    pub fn has_blocking_conflicts(&self, fail_on: ConflictSeverity) -> bool {
+        self.conflict_graph
+            .edges
+            .iter()
+            .any(|edge| edge.severity.rank() >= fail_on.rank())
+    }
+}
+
+impl AnalysisView {
     pub fn render(&self) -> String {
         let mut output = String::new();
 
@@ -370,7 +464,7 @@ impl AnalysisReport {
         ));
         output.push_str(&format!("Accounts inspected: {}\n\n", self.total_accounts));
         output.push_str(&format!("Parallelism score: {}/100\n", self.score));
-        output.push_str(&format!("Expected gain: {}\n\n", self.expected_gain()));
+        output.push_str(&format!("Expected gain: {}\n\n", expected_gain(self.score)));
 
         if self.total_accounts == 0 {
             match self.analysis_mode {
@@ -494,12 +588,11 @@ impl AnalysisReport {
         output
     }
 
-    fn expected_gain(&self) -> &'static str {
-        if self.total_accounts == 0 {
-            return "unknown - no Anchor-style accounts detected";
-        }
-
-        expected_gain(self.score)
+    pub fn has_blocking_conflicts(&self, fail_on: ConflictSeverity) -> bool {
+        self.conflict_graph
+            .edges
+            .iter()
+            .any(|edge| edge.severity.rank() >= fail_on.rank())
     }
 }
 
@@ -518,6 +611,14 @@ impl ConflictSeverity {
             ConflictSeverity::Low => "low",
             ConflictSeverity::Medium => "medium",
             ConflictSeverity::High => "high",
+        }
+    }
+
+    pub fn rank(self) -> u8 {
+        match self {
+            ConflictSeverity::Low => 0,
+            ConflictSeverity::Medium => 1,
+            ConflictSeverity::High => 2,
         }
     }
 }
@@ -1014,8 +1115,10 @@ fn build_conflict_graph(contexts: &[InstructionContext]) -> ConflictGraph {
     }
 
     edges.sort_by(|left, right| {
-        severity_rank(right.severity)
-            .cmp(&severity_rank(left.severity))
+        right
+            .severity
+            .rank()
+            .cmp(&left.severity.rank())
             .then_with(|| right.shared_accounts.len().cmp(&left.shared_accounts.len()))
             .then_with(|| left.left_context.cmp(&right.left_context))
             .then_with(|| left.right_context.cmp(&right.right_context))
@@ -1106,14 +1209,6 @@ fn build_conflict_suggestions(
     }
 
     suggestions
-}
-
-fn severity_rank(severity: ConflictSeverity) -> usize {
-    match severity {
-        ConflictSeverity::Low => 0,
-        ConflictSeverity::Medium => 1,
-        ConflictSeverity::High => 2,
-    }
 }
 
 impl InstructionContext {
@@ -1264,5 +1359,83 @@ pub struct Swap<'info> {
             .repeated_accounts
             .iter()
             .any(|(name, count)| name == "vault" && *count == 2));
+    }
+
+    #[test]
+    fn filters_conflicts_by_severity_and_top() {
+        let report = AnalysisReport {
+            path: PathBuf::from("program.json"),
+            analysis_mode: AnalysisMode::AnchorIdl,
+            files_scanned: 1,
+            instruction_contexts: 3,
+            total_accounts: 6,
+            mutable_accounts: vec![],
+            shared_accounts: vec![],
+            repeated_accounts: vec![],
+            hotspots: vec![],
+            conflicts: vec![
+                ConflictPair {
+                    left_context: "a".to_string(),
+                    right_context: "b".to_string(),
+                    shared_accounts: vec!["x".to_string()],
+                    severity: ConflictSeverity::Low,
+                    suggestions: vec!["low".to_string()],
+                },
+                ConflictPair {
+                    left_context: "b".to_string(),
+                    right_context: "c".to_string(),
+                    shared_accounts: vec!["y".to_string()],
+                    severity: ConflictSeverity::Medium,
+                    suggestions: vec!["medium".to_string()],
+                },
+                ConflictPair {
+                    left_context: "c".to_string(),
+                    right_context: "d".to_string(),
+                    shared_accounts: vec!["z".to_string()],
+                    severity: ConflictSeverity::High,
+                    suggestions: vec!["high".to_string()],
+                },
+            ],
+            conflict_graph: ConflictGraph {
+                nodes: vec![],
+                edges: vec![
+                    ConflictEdge {
+                        left_context: "c".to_string(),
+                        right_context: "d".to_string(),
+                        shared_accounts: vec!["z".to_string()],
+                        severity: ConflictSeverity::High,
+                        suggestions: vec!["high".to_string()],
+                    },
+                    ConflictEdge {
+                        left_context: "b".to_string(),
+                        right_context: "c".to_string(),
+                        shared_accounts: vec!["y".to_string()],
+                        severity: ConflictSeverity::Medium,
+                        suggestions: vec!["medium".to_string()],
+                    },
+                    ConflictEdge {
+                        left_context: "a".to_string(),
+                        right_context: "b".to_string(),
+                        shared_accounts: vec!["x".to_string()],
+                        severity: ConflictSeverity::Low,
+                        suggestions: vec!["low".to_string()],
+                    },
+                ],
+            },
+            score: 50,
+        };
+
+        let view = report.view(ReportFilters {
+            severity_cutoff: ConflictSeverity::Medium,
+            top: Some(1),
+        });
+
+        assert_eq!(view.conflicts.len(), 1);
+        assert_eq!(
+            view.conflicts[0].severity.rank(),
+            ConflictSeverity::High.rank()
+        );
+        assert_eq!(view.conflict_graph.edges.len(), 1);
+        assert!(view.has_blocking_conflicts(ConflictSeverity::High));
     }
 }
