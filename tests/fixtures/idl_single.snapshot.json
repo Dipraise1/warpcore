@@ -116,5 +116,19 @@
       }
     ]
   },
-  "score": 39
+  "score": 39,
+  "security_warnings": [
+    {
+      "kind": "NoSigner",
+      "instruction": "deposit",
+      "account": "",
+      "message": "`deposit` mutates accounts but declares no signer — any caller can invoke it"
+    },
+    {
+      "kind": "NoSigner",
+      "instruction": "withdraw",
+      "account": "",
+      "message": "`withdraw` mutates accounts but declares no signer — any caller can invoke it"
+    }
+  ]
 }

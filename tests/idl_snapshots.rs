@@ -6,8 +6,14 @@ use warpcore::analyzer::analyze_path;
 fn assert_snapshot(path: &str, snapshot: &str) {
     let report = analyze_path(Path::new(path)).expect("analyze path");
     let actual = serde_json::to_string_pretty(&report).expect("serialize report");
-    let expected = fs::read_to_string(snapshot).expect("read snapshot");
 
+    if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
+        fs::write(snapshot, actual.trim_end().to_string() + "\n")
+            .expect("write snapshot");
+        return;
+    }
+
+    let expected = fs::read_to_string(snapshot).expect("read snapshot");
     assert_eq!(actual.trim_end(), expected.trim_end());
 }
 

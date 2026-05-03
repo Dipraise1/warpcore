@@ -32,6 +32,7 @@ pub struct AnalysisReport {
     pub conflicts: Vec<ConflictPair>,
     pub conflict_graph: ConflictGraph,
     pub score: u8,
+    pub security_warnings: Vec<SecurityWarning>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,7 @@ pub struct AnalysisView {
     pub conflicts: Vec<ConflictPair>,
     pub conflict_graph: ConflictGraph,
     pub score: u8,
+    pub security_warnings: Vec<SecurityWarning>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -129,6 +131,44 @@ pub enum ConflictSeverity {
     High,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityWarning {
+    pub kind: SecurityWarnKind,
+    pub instruction: String,
+    pub account: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SecurityWarnKind {
+    /// Authority/admin account is writable but not a signer — anyone can impersonate it.
+    UnsignedAuthority,
+    /// Instruction mutates state but has no signer at all.
+    NoSigner,
+    /// `AccountInfo` used directly with no type-level validation.
+    UncheckedAccount,
+    /// A program or sysvar account is marked mutable, which is almost always a bug.
+    WritableProgram,
+}
+
+impl SecurityWarnKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            SecurityWarnKind::UnsignedAuthority => "unsigned-authority",
+            SecurityWarnKind::NoSigner => "no-signer",
+            SecurityWarnKind::UncheckedAccount => "unchecked-account",
+            SecurityWarnKind::WritableProgram => "writable-program",
+        }
+    }
+
+    pub fn is_critical(self) -> bool {
+        matches!(
+            self,
+            SecurityWarnKind::UnsignedAuthority | SecurityWarnKind::NoSigner
+        )
+    }
+}
+
 pub fn analyze_path(path: &Path) -> io::Result<AnalysisReport> {
     if path.is_file()
         && path
@@ -159,12 +199,14 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
     let mut mutable_accounts = BTreeSet::new();
     let mut shared_accounts = BTreeSet::new();
     let mut account_frequency = BTreeMap::<String, usize>::new();
+    let mut security_warnings = Vec::new();
 
     for file in &files {
         let source = fs::read_to_string(file)?;
         let file_report = analyze_source(file, &source);
         instruction_contexts.extend(file_report.instruction_contexts);
         total_accounts += file_report.total_accounts;
+        security_warnings.extend(file_report.security_warnings);
 
         for finding in file_report.mutable_accounts {
             mutable_accounts.insert(finding);
@@ -222,6 +264,7 @@ fn analyze_rust_path(path: &Path) -> io::Result<AnalysisReport> {
         conflicts,
         conflict_graph,
         score,
+        security_warnings,
     })
 }
 
@@ -237,6 +280,7 @@ fn analyze_idl_file(path: &Path) -> io::Result<AnalysisReport> {
         parts.mutable_accounts,
         parts.shared_accounts,
         parts.account_frequency,
+        parts.security_warnings,
     )
 }
 
@@ -252,6 +296,7 @@ fn analyze_idl_directory(path: &Path, json_files: Vec<PathBuf>) -> io::Result<An
         merged.total_accounts += parts.total_accounts;
         merged.mutable_accounts.extend(parts.mutable_accounts);
         merged.shared_accounts.extend(parts.shared_accounts);
+        merged.security_warnings.extend(parts.security_warnings);
         for (name, count) in parts.account_frequency {
             *merged.account_frequency.entry(name).or_default() += count;
         }
@@ -271,6 +316,7 @@ fn analyze_idl_directory(path: &Path, json_files: Vec<PathBuf>) -> io::Result<An
         merged.mutable_accounts,
         merged.shared_accounts,
         merged.account_frequency,
+        merged.security_warnings,
     )
 }
 
@@ -287,8 +333,14 @@ fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts>
     let mut mutable_accounts = BTreeSet::new();
     let mut shared_accounts = BTreeSet::new();
     let mut account_frequency = BTreeMap::<String, usize>::new();
+    let mut security_warnings = Vec::new();
 
     for instruction in idl.instructions {
+        let flat_accounts = flatten_idl_accounts(&instruction.accounts);
+
+        security_warnings
+            .extend(detect_security_warnings_idl(&instruction.name, &flat_accounts));
+
         let mut context = InstructionContext {
             name: instruction.name,
             file: path.to_path_buf(),
@@ -296,7 +348,7 @@ fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts>
             accounts: Vec::new(),
         };
 
-        for account in flatten_idl_accounts(&instruction.accounts) {
+        for account in flat_accounts {
             total_accounts += 1;
             *account_frequency.entry(account.name.clone()).or_default() += 1;
 
@@ -327,6 +379,7 @@ fn analyze_idl_source(path: &Path, source: &str) -> io::Result<IdlAnalysisParts>
         mutable_accounts,
         shared_accounts,
         account_frequency,
+        security_warnings,
     })
 }
 
@@ -339,6 +392,7 @@ fn build_report(
     mutable_accounts: BTreeSet<AccountFinding>,
     shared_accounts: BTreeSet<AccountFinding>,
     account_frequency: BTreeMap<String, usize>,
+    security_warnings: Vec<SecurityWarning>,
 ) -> io::Result<AnalysisReport> {
     let repeated_accounts = account_frequency
         .into_iter()
@@ -383,6 +437,7 @@ fn build_report(
         conflicts,
         conflict_graph,
         score,
+        security_warnings,
     })
 }
 
@@ -434,6 +489,7 @@ impl AnalysisReport {
             conflicts,
             conflict_graph,
             score: self.score,
+            security_warnings: self.security_warnings.clone(),
         }
     }
 
@@ -451,9 +507,32 @@ impl AnalysisReport {
 
 impl AnalysisView {
     pub fn render(&self) -> String {
+        self.render_colored(false)
+    }
+
+    pub fn render_colored(&self, color: bool) -> String {
+        let bold = if color { "\x1b[1m" } else { "" };
+        let reset = if color { "\x1b[0m" } else { "" };
+        let red = if color { "\x1b[31m" } else { "" };
+        let yellow = if color { "\x1b[33m" } else { "" };
+        let green = if color { "\x1b[32m" } else { "" };
+        let cyan = if color { "\x1b[36m" } else { "" };
+
+        let score_color = if color {
+            if self.score >= 70 {
+                green
+            } else if self.score >= 40 {
+                yellow
+            } else {
+                red
+            }
+        } else {
+            ""
+        };
+
         let mut output = String::new();
 
-        output.push_str("Warpcore analysis\n");
+        output.push_str(&format!("{bold}Warpcore analysis{reset}\n"));
         output.push_str("=================\n\n");
         output.push_str(&format!("Path: {}\n", self.path.display()));
         output.push_str(&format!("Analysis mode: {}\n", self.analysis_mode.label()));
@@ -463,8 +542,14 @@ impl AnalysisView {
             self.instruction_contexts
         ));
         output.push_str(&format!("Accounts inspected: {}\n\n", self.total_accounts));
-        output.push_str(&format!("Parallelism score: {}/100\n", self.score));
-        output.push_str(&format!("Expected gain: {}\n\n", expected_gain(self.score)));
+        output.push_str(&format!(
+            "Parallelism score: {score_color}{bold}{}/100{reset}\n",
+            self.score
+        ));
+        output.push_str(&format!(
+            "Expected gain: {cyan}{}{reset}\n\n",
+            expected_gain(self.score)
+        ));
 
         if self.total_accounts == 0 {
             match self.analysis_mode {
@@ -484,11 +569,11 @@ impl AnalysisView {
             return output;
         }
 
-        output.push_str("Hot accounts\n");
+        output.push_str(&format!("{bold}Hot accounts{reset}\n"));
         output.push_str("------------\n");
 
         if self.hotspots.is_empty() {
-            output.push_str("- No obvious account hot spots found by the basic scanner.\n");
+            output.push_str("- No obvious account hot spots found.\n");
         } else {
             for hotspot in self.hotspots.iter().take(8) {
                 let sample_contexts = hotspot
@@ -499,7 +584,7 @@ impl AnalysisView {
                     .collect::<Vec<_>>()
                     .join(", ");
                 output.push_str(&format!(
-                    "- `{}` appears {} times across {} contexts ({} writable occurrences){}\n",
+                    "- `{yellow}{}{reset}` appears {} times across {} contexts ({} writable){}\n",
                     hotspot.name,
                     hotspot.total_occurrences,
                     hotspot.context_count,
@@ -513,18 +598,24 @@ impl AnalysisView {
             }
         }
 
-        output.push_str("\nConflict graph\n");
+        output.push_str(&format!("\n{bold}Conflict graph{reset}\n"));
         output.push_str("--------------\n");
 
         if self.conflicts.is_empty() {
             output.push_str(
-                "- No shared writable accounts were found between instruction contexts.\n",
+                "- No shared writable accounts found between instruction contexts.\n",
             );
         } else {
             for conflict in self.conflicts.iter().take(8) {
+                let sev_label = conflict.severity.label();
+                let severity_colored = match conflict.severity {
+                    ConflictSeverity::High => format!("{red}{bold}{sev_label}{reset}"),
+                    ConflictSeverity::Medium => format!("{yellow}{sev_label}{reset}"),
+                    ConflictSeverity::Low => format!("{green}{sev_label}{reset}"),
+                };
                 output.push_str(&format!(
                     "- [{}] {} <-> {} share `{}`\n",
-                    conflict.severity.label(),
+                    severity_colored,
                     conflict.left_context,
                     conflict.right_context,
                     conflict.shared_accounts.join("`, `")
@@ -536,7 +627,7 @@ impl AnalysisView {
         }
 
         if !self.mutable_accounts.is_empty() || !self.shared_accounts.is_empty() {
-            output.push_str("\nWrite lock signals\n");
+            output.push_str(&format!("\n{bold}Write lock signals{reset}\n"));
             output.push_str("------------------\n");
 
             for finding in self.mutable_accounts.iter().take(6) {
@@ -562,7 +653,7 @@ impl AnalysisView {
         }
 
         if !self.repeated_accounts.is_empty() {
-            output.push_str("\nRepeated accounts\n");
+            output.push_str(&format!("\n{bold}Repeated accounts{reset}\n"));
             output.push_str("-----------------\n");
 
             for (name, count) in self.repeated_accounts.iter().take(6) {
@@ -573,7 +664,23 @@ impl AnalysisView {
             }
         }
 
-        output.push_str("\nHow to fix it\n");
+        if !self.security_warnings.is_empty() {
+            let header_color = if color { red } else { "" };
+            output.push_str(&format!(
+                "\n{header_color}{bold}Security warnings{reset}\n"
+            ));
+            output.push_str("------------------\n");
+            for warning in &self.security_warnings {
+                let prefix = if warning.kind.is_critical() {
+                    format!("{red}{bold}[{}]{reset}", warning.kind.label())
+                } else {
+                    format!("{yellow}[{}]{reset}", warning.kind.label())
+                };
+                output.push_str(&format!("- {} {}\n", prefix, warning.message));
+            }
+        }
+
+        output.push_str(&format!("\n{bold}How to fix it{reset}\n"));
         output.push_str("-------------\n");
         output.push_str("- Make accounts read-only when the instruction only reads them.\n");
         output.push_str("- Split global state into user, market, pool, or shard PDAs.\n");
@@ -583,7 +690,7 @@ impl AnalysisView {
         );
 
         output.push_str(
-            "\nPrototype note: this is an analyzer prototype. IDL mode uses Anchor metadata; Rust mode is still heuristic.\n",
+            "\nNote: IDL mode uses Anchor metadata; Rust mode uses heuristics and may have false positives.\n",
         );
         output
     }
@@ -630,6 +737,7 @@ struct SourceReport {
     mutable_accounts: Vec<AccountFinding>,
     shared_accounts: Vec<AccountFinding>,
     account_names: Vec<String>,
+    security_warnings: Vec<SecurityWarning>,
 }
 
 #[derive(Debug, Default)]
@@ -639,6 +747,7 @@ struct IdlAnalysisParts {
     mutable_accounts: BTreeSet<AccountFinding>,
     shared_accounts: BTreeSet<AccountFinding>,
     account_frequency: BTreeMap<String, usize>,
+    security_warnings: Vec<SecurityWarning>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -666,6 +775,8 @@ enum AnchorIdlAccountItem {
         name: String,
         #[serde(default, rename = "isMut", alias = "mut")]
         is_mut: bool,
+        #[serde(default, rename = "isSigner", alias = "signer")]
+        is_signer: bool,
     },
 }
 
@@ -696,11 +807,13 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
     let mut mutable_accounts = Vec::new();
     let mut shared_accounts = Vec::new();
     let mut account_names = Vec::new();
+    let mut security_warnings = Vec::new();
 
     let mut in_accounts_struct = false;
     let mut saw_accounts_derive = false;
     let mut brace_depth = 0usize;
     let mut pending_mut = false;
+    let mut pending_signer = false;
     let mut current_context: Option<InstructionContext> = None;
 
     for (index, raw_line) in source.lines().enumerate() {
@@ -738,11 +851,16 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
             .saturating_add(count_char(line, '{'))
             .saturating_sub(count_char(line, '}'));
 
-        if line.starts_with("#[account") && has_mut_attribute(line) {
-            pending_mut = true;
+        if line.starts_with("#[account") {
+            if has_mut_attribute(line) {
+                pending_mut = true;
+            }
+            if line.contains("signer") {
+                pending_signer = true;
+            }
         }
 
-        if let Some(account_name) = parse_account_field(line) {
+        if let Some((account_name, account_type)) = parse_account_field_type(line) {
             total_accounts += 1;
             account_names.push(account_name.clone());
 
@@ -768,10 +886,17 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
                     name: account_name.clone(),
                     file: context_file.clone(),
                     line: line_number,
-                    context: context_name,
+                    context: context_name.clone(),
                     reason: format!("name contains `{}`", hint),
                 });
             }
+
+            security_warnings.extend(detect_security_warnings_rust(
+                &context_name,
+                &account_name,
+                &account_type,
+                pending_signer,
+            ));
 
             if let Some(context) = current_context.as_mut() {
                 context.accounts.push(AccountOccurrence {
@@ -781,11 +906,13 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
             }
 
             pending_mut = false;
+            pending_signer = false;
         }
 
         if brace_depth == 0 {
             in_accounts_struct = false;
             pending_mut = false;
+            pending_signer = false;
             if let Some(context) = current_context.take() {
                 instruction_contexts.push(context);
             }
@@ -802,6 +929,7 @@ fn analyze_source(file: &Path, source: &str) -> SourceReport {
         mutable_accounts,
         shared_accounts,
         account_names,
+        security_warnings,
     }
 }
 
@@ -928,6 +1056,7 @@ fn should_skip(path: &Path) -> bool {
 struct FlattenedIdlAccount {
     name: String,
     is_mut: bool,
+    is_signer: bool,
 }
 
 fn flatten_idl_accounts(items: &[AnchorIdlAccountItem]) -> Vec<FlattenedIdlAccount> {
@@ -935,10 +1064,15 @@ fn flatten_idl_accounts(items: &[AnchorIdlAccountItem]) -> Vec<FlattenedIdlAccou
 
     for item in items {
         match item {
-            AnchorIdlAccountItem::Account { name, is_mut } => {
+            AnchorIdlAccountItem::Account {
+                name,
+                is_mut,
+                is_signer,
+            } => {
                 flattened.push(FlattenedIdlAccount {
                     name: name.clone(),
                     is_mut: *is_mut,
+                    is_signer: *is_signer,
                 });
             }
             AnchorIdlAccountItem::Group { accounts, .. } => {
@@ -948,25 +1082,6 @@ fn flatten_idl_accounts(items: &[AnchorIdlAccountItem]) -> Vec<FlattenedIdlAccou
     }
 
     flattened
-}
-
-fn parse_account_field(line: &str) -> Option<String> {
-    if !line.starts_with("pub ") || !line.contains(':') {
-        return None;
-    }
-
-    let before_type = line.split(':').next()?;
-    let name = before_type
-        .trim_start_matches("pub")
-        .trim()
-        .trim_start_matches("mut")
-        .trim();
-
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
 }
 
 fn parse_struct_name(line: &str) -> Option<String> {
@@ -1004,6 +1119,136 @@ fn shared_account_hint(account_name: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|hint| normalized.contains(hint))
+}
+
+const AUTHORITY_HINTS: &[&str] = &["authority", "admin", "owner", "operator"];
+const PROGRAM_ACCOUNTS: &[&str] = &[
+    "system_program",
+    "token_program",
+    "associated_token_program",
+    "rent",
+    "clock",
+    "instructions",
+];
+
+fn detect_security_warnings_idl(
+    instruction: &str,
+    accounts: &[FlattenedIdlAccount],
+) -> Vec<SecurityWarning> {
+    let mut warnings = Vec::new();
+    let has_any_signer = accounts.iter().any(|a| a.is_signer);
+    let has_mutation = accounts.iter().any(|a| a.is_mut);
+
+    if has_mutation && !has_any_signer {
+        warnings.push(SecurityWarning {
+            kind: SecurityWarnKind::NoSigner,
+            instruction: instruction.to_string(),
+            account: String::new(),
+            message: format!(
+                "`{instruction}` mutates accounts but declares no signer — any caller can invoke it"
+            ),
+        });
+    }
+
+    for account in accounts {
+        let lower = account.name.to_ascii_lowercase();
+
+        if account.is_mut && !account.is_signer {
+            if AUTHORITY_HINTS.iter().any(|h| lower.contains(h)) {
+                warnings.push(SecurityWarning {
+                    kind: SecurityWarnKind::UnsignedAuthority,
+                    instruction: instruction.to_string(),
+                    account: account.name.clone(),
+                    message: format!(
+                        "`{}` in `{instruction}` is writable but not a signer — \
+                         missing signer check allows authority spoofing",
+                        account.name
+                    ),
+                });
+            }
+        }
+
+        let is_program_account = PROGRAM_ACCOUNTS.iter().any(|p| lower == *p)
+            || lower.ends_with("_program");
+        if is_program_account && account.is_mut {
+            warnings.push(SecurityWarning {
+                kind: SecurityWarnKind::WritableProgram,
+                instruction: instruction.to_string(),
+                account: account.name.clone(),
+                message: format!(
+                    "`{}` in `{instruction}` is a program/sysvar marked mutable — \
+                     this is almost certainly a bug",
+                    account.name
+                ),
+            });
+        }
+    }
+
+    warnings
+}
+
+fn detect_security_warnings_rust(
+    instruction: &str,
+    account_name: &str,
+    account_type: &str,
+    has_signer_attr: bool,
+) -> Vec<SecurityWarning> {
+    let mut warnings = Vec::new();
+    let type_lower = account_type.to_ascii_lowercase();
+    let name_lower = account_name.to_ascii_lowercase();
+
+    if type_lower.contains("accountinfo") {
+        warnings.push(SecurityWarning {
+            kind: SecurityWarnKind::UncheckedAccount,
+            instruction: instruction.to_string(),
+            account: account_name.to_string(),
+            message: format!(
+                "`{account_name}` in `{instruction}` uses raw `AccountInfo` — \
+                 add type-level validation or annotate with `/// CHECK:`"
+            ),
+        });
+    }
+
+    let is_authority = AUTHORITY_HINTS.iter().any(|h| name_lower.contains(h));
+    let is_signer_type = type_lower.contains("signer");
+    if is_authority && !is_signer_type && !has_signer_attr {
+        warnings.push(SecurityWarning {
+            kind: SecurityWarnKind::UnsignedAuthority,
+            instruction: instruction.to_string(),
+            account: account_name.to_string(),
+            message: format!(
+                "`{account_name}` in `{instruction}` looks like an authority but is not \
+                 typed as `Signer` — verify the signer constraint is enforced"
+            ),
+        });
+    }
+
+    warnings
+}
+
+fn parse_account_field_type(line: &str) -> Option<(String, String)> {
+    if !line.starts_with("pub ") || !line.contains(':') {
+        return None;
+    }
+    let mut parts = line.splitn(2, ':');
+    let before = parts.next()?;
+    let after = parts
+        .next()?
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .to_string();
+    let name = before
+        .trim_start_matches("pub")
+        .trim()
+        .trim_start_matches("mut")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some((name, after))
+    }
 }
 
 fn score_parallelism(
@@ -1423,6 +1668,7 @@ pub struct Swap<'info> {
                 ],
             },
             score: 50,
+            security_warnings: vec![],
         };
 
         let view = report.view(ReportFilters {
